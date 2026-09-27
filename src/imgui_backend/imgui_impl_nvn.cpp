@@ -7,7 +7,6 @@
 #include "nn/hid.h"
 
 #include "helpers/InputHelper.h"
-#include "MemoryPoolMaker.h"
 #include "imgui_backend_config.h"
 
 #if IMGUI_XENO_LOAD_DEFAULT_FONT
@@ -185,7 +184,7 @@ namespace ImguiNvnBackend {
     int pointCount = quadVertCount * quadCount;
 
     size_t totalVtxSize = pointCount * sizeof(ImDrawVert);
-    if (!bd->vtxBuffer || bd->vtxBuffer->GetPoolSize() < totalVtxSize) {
+    if (!bd->vtxBuffer || !bd->vtxBuffer->IsBufferReady() || bd->vtxBuffer->GetPoolSize() < totalVtxSize) {
       if (bd->vtxBuffer) {
         bd->vtxBuffer->Finalize();
         IM_FREE(bd->vtxBuffer);
@@ -225,6 +224,7 @@ namespace ImguiNvnBackend {
 
     auto handle = bd->cmdBuf->EndRecording();
     bd->queue->SubmitCommands(1, &handle);
+    bd->textures.MarkSubmitted(bd->queue);
   }
 
 // backend impl
@@ -267,99 +267,16 @@ namespace ImguiNvnBackend {
     return false;
   }
 
-  bool setupFont() {
-
-    Logger::log("Setting up ImGui Font.\n");
-
-    auto bd = getBackendData();
-
-    ImGuiIO &io = ImGui::GetIO();
-
-    // init sampler and texture pools
-
-    int sampDescSize = 0;
-    bd->device->GetInteger(nvn::DeviceInfo::SAMPLER_DESCRIPTOR_SIZE, &sampDescSize);
-    int texDescSize = 0;
-    bd->device->GetInteger(nvn::DeviceInfo::TEXTURE_DESCRIPTOR_SIZE, &texDescSize);
-
-    int sampMemPoolSize = sampDescSize * MaxSampDescriptors;
-    int texMemPoolSize = texDescSize * MaxTexDescriptors;
-    int totalPoolSize = ALIGN_UP(sampMemPoolSize + texMemPoolSize, 0x1000);
-    if (!MemoryPoolMaker::createPool(&bd->sampTexMemPool, totalPoolSize)) {
-      Logger::log("Failed to Create Texture/Sampler Memory Pool!\n");
+  bool setupTextures() {
+    auto* bd = getBackendData();
+    if (!bd->textures.Initialize(bd->device)) {
+      Logger::log("Failed to initialize dynamic texture resources!\n");
       return false;
     }
-
-    if (!bd->samplerPool.Initialize(&bd->sampTexMemPool, 0, MaxSampDescriptors)) {
-      Logger::log("Failed to Create Sampler Pool!\n");
-      return false;
-    }
-
-    if (!bd->texPool.Initialize(&bd->sampTexMemPool, sampMemPoolSize, MaxTexDescriptors)) {
-      Logger::log("Failed to Create Texture Pool!\n");
-      return false;
-    }
-
-    // convert imgui font texels
-
-    unsigned char *pixels;
-    int width, height, pixelByteSize;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height, &pixelByteSize);
-    int texPoolSize = pixelByteSize * width * height;
-
-    if (!MemoryPoolMaker::createPool(&bd->fontMemPool, ALIGN_UP(texPoolSize, 0x1000),
-                                     nvn::MemoryPoolFlags::CPU_UNCACHED | nvn::MemoryPoolFlags::GPU_CACHED)) {
-      Logger::log("Failed to Create Font Memory Pool!\n");
-      return false;
-    }
-
-    bd->texBuilder.SetDefaults()
-        .SetDevice(bd->device)
-        .SetTarget(nvn::TextureTarget::TARGET_2D)
-        .SetFormat(nvn::Format::RGBA8)
-        .SetSize2D(width, height)
-        .SetStorage(&bd->fontMemPool, 0);
-
-    if (!bd->fontTexture.Initialize(&bd->texBuilder)) {
-      Logger::log("Failed to Create Font Texture!\n");
-      return false;
-    }
-
-    // setup font texture
-
-    nvn::CopyRegion region = {
-        .xoffset = 0,
-        .yoffset = 0,
-        .zoffset = 0,
-        .width = bd->fontTexture.GetWidth(),
-        .height = bd->fontTexture.GetHeight(),
-        .depth = 1
-    };
-
-    bd->fontTexture.WriteTexels(nullptr, &region, pixels);
-    bd->fontTexture.FlushTexels(nullptr, &region);
-
-    bd->samplerBuilder.SetDefaults()
-        .SetDevice(bd->device)
-        .SetMinMagFilter(nvn::MinFilter::LINEAR, nvn::MagFilter::LINEAR)
-        .SetWrapMode(nvn::WrapMode::CLAMP, nvn::WrapMode::CLAMP, nvn::WrapMode::CLAMP);
-
-    if (!bd->fontSampler.Initialize(&bd->samplerBuilder)) {
-      Logger::log("Failed to Init Font Sampler!\n");
-      return false;
-    }
-
-    bd->textureId = 257;
-    bd->samplerId = 257;
-
-    bd->texPool.RegisterTexture(bd->textureId, &bd->fontTexture, nullptr);
-    bd->samplerPool.RegisterSampler(bd->samplerId, &bd->fontSampler);
-
-    bd->fontTexHandle = bd->device->GetTextureHandle(bd->textureId, bd->samplerId);
-    io.Fonts->SetTexID(&bd->fontTexHandle);
-
-    Logger::log("Finished.\n");
-
+    int maxTextureSize = 0;
+    bd->device->GetInteger(nvn::DeviceInfo::MAX_TEXTURE_SIZE, &maxTextureSize);
+    ImGuiPlatformIO& platform = ImGui::GetPlatformIO();
+    platform.Renderer_TextureMaxWidth = platform.Renderer_TextureMaxHeight = maxTextureSize;
     return true;
   }
 
@@ -369,7 +286,7 @@ namespace ImguiNvnBackend {
 
     auto bd = getBackendData();
 
-    if (!bd->shaderProgram.Initialize(bd->device)) {
+    if (!(bd->shaderProgramReady = bd->shaderProgram.Initialize(bd->device))) {
       Logger::log("Failed to Initialize Shader Program!");
       return false;
     }
@@ -424,10 +341,14 @@ namespace ImguiNvnBackend {
     return true;
   }
 
-  void InitBackend(const NvnBackendInitInfo &initInfo) {
+  bool InitBackend(const NvnBackendInitInfo &initInfo) {
     ImGuiIO &io = ImGui::GetIO();
     XENO_ASSERT(!io.BackendRendererUserData, "Already Initialized Imgui Backend!");
 
+    if (io.Fonts->RefCount > 1) {
+      Logger::log("The NVN backend requires an unshared font atlas.\n");
+      return false;
+    }
     io.BackendPlatformName = "Switch";
     io.BackendRendererName = "imgui_impl_nvn";
     io.IniFilename = nullptr;
@@ -463,19 +384,46 @@ namespace ImguiNvnBackend {
       if (bd->isUseTestShader)
         initTestShader();
 
-      if (setupShaders(bd->imguiShaderBinary.ptr, bd->imguiShaderBinary.size) && setupFont()) {
+      if (setupShaders(bd->imguiShaderBinary.ptr, bd->imguiShaderBinary.size) && setupTextures()) {
         Logger::log("Rendering Setup!\n");
 
         bd->isInitialized = true;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+        return true;
 
       } else {
         Logger::log("Failed to Setup Render Data!\n");
       }
     }
+    ShutdownBackend();
+    return false;
   }
 
   void ShutdownBackend() {
-
+    ImGuiIO& io = ImGui::GetIO();
+    auto* bd = static_cast<NvnBackendData*>(io.BackendRendererUserData);
+    if (!bd)
+      return;
+    if (!bd->textures.Shutdown()) {
+      Logger::log("GPU fence incomplete; retaining NVN resources.\n");
+      return;
+    }
+    if (bd->shaderProgramReady) bd->shaderProgram.Finalize();
+    if (bd->isUseTestShader) bd->testShader.Finalize();
+    for (MemoryBuffer* buffer : {bd->vtxBuffer, bd->idxBuffer, bd->uniformMemory, bd->shaderMemory, bd->testShaderBuffer}) {
+      if (buffer) {
+        buffer->Finalize();
+        IM_DELETE(buffer);
+      }
+    }
+    IM_FREE(bd->imguiShaderBinary.ptr);
+    IM_FREE(bd->testShaderBinary.ptr);
+    io.BackendRendererUserData = nullptr;
+    io.BackendRendererName = io.BackendPlatformName = nullptr;
+    io.BackendFlags &= ~(ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_HasGamepad);
+    ImGui::GetPlatformIO().Renderer_TextureMaxWidth = 0;
+    ImGui::GetPlatformIO().Renderer_TextureMaxHeight = 0;
+    IM_DELETE(bd);
   }
 
   bool updateTouch(ImGuiIO &io) {
@@ -622,20 +570,14 @@ namespace ImguiNvnBackend {
     bd->cmdBuf->BindVertexAttribState(3, bd->attribStates);
     bd->cmdBuf->BindVertexStreamState(1, &bd->streamState);
 
-    bd->cmdBuf->SetTexturePool(&bd->texPool);
-    bd->cmdBuf->SetSamplerPool(&bd->samplerPool);
+    bd->textures.BindPools(bd->cmdBuf);
   }
 
   void renderDrawData(ImDrawData *drawData) {
 
     // we dont need to process any data if it isnt valid
-    if (!drawData->Valid) {
+    if (!drawData || !drawData->Valid) {
 //            Logger::log("Draw Data was Invalid! Skipping Render.");
-      return;
-    }
-    // if we dont have any command lists to draw, we can stop here
-    if (drawData->CmdListsCount == 0) {
-//            Logger::log("Command List was Empty! Skipping Render.\n");
       return;
     }
 
@@ -649,6 +591,16 @@ namespace ImguiNvnBackend {
       return;
     }
 
+    // This also waits for the previous overlay submission before CPU writes,
+    // descriptor recycling, buffer resizing, or texture destruction. Process
+    // texture requests even when this frame has no geometry (e.g. collapsed UI).
+    if (!bd->textures.UpdateTextures(drawData->Textures)) {
+      Logger::log("NVN texture update or GPU wait failed; skipping overlay frame.\n");
+      return;
+    }
+    if (drawData->CmdLists.empty() || drawData->TotalVtxCount == 0 || drawData->TotalIdxCount == 0)
+      return;
+
     // disable imgui rendering if we are using the test shader code
     if (bd->isUseTestShader) {
       renderTestShader(drawData);
@@ -657,7 +609,7 @@ namespace ImguiNvnBackend {
 
     // initializes/resizes buffer used for all vertex data created by ImGui
     size_t totalVtxSize = drawData->TotalVtxCount * sizeof(ImDrawVert);
-    if (!bd->vtxBuffer || bd->vtxBuffer->GetPoolSize() < totalVtxSize) {
+    if (!bd->vtxBuffer || !bd->vtxBuffer->IsBufferReady() || bd->vtxBuffer->GetPoolSize() < totalVtxSize) {
       if (bd->vtxBuffer) {
         bd->vtxBuffer->Finalize();
         IM_FREE(bd->vtxBuffer);
@@ -671,7 +623,7 @@ namespace ImguiNvnBackend {
 
     // initializes/resizes buffer used for all index data created by ImGui
     size_t totalIdxSize = drawData->TotalIdxCount * sizeof(ImDrawIdx);
-    if (!bd->idxBuffer || bd->idxBuffer->GetPoolSize() < totalIdxSize) {
+    if (!bd->idxBuffer || !bd->idxBuffer->IsBufferReady() || bd->idxBuffer->GetPoolSize() < totalIdxSize) {
       if (bd->idxBuffer) {
 
         bd->idxBuffer->Finalize();
@@ -710,9 +662,7 @@ namespace ImguiNvnBackend {
     nvn::TextureHandle boundTextureHandle = 0;
 
     // load data into buffers, and process draw commands
-    for (int i = 0; i < drawData->CmdListsCount; i++) {
-
-      auto cmdList = drawData->CmdLists[i];
+    for (const ImDrawList *cmdList: drawData->CmdLists) {
 
       // calc vertex and index buffer sizes
       size_t vtxSize = cmdList->VtxBuffer.Size * sizeof(ImDrawVert);
@@ -750,7 +700,7 @@ namespace ImguiNvnBackend {
         //bd->cmdBuf->SetScissor(0, 0, io.DisplaySize.x, io.DisplaySize.y);
 
         // get texture ID from the command
-        nvn::TextureHandle TexID = *(nvn::TextureHandle *) cmd.GetTexID();
+        nvn::TextureHandle TexID = static_cast<nvn::TextureHandle>(cmd.GetTexID());
         // if our previous handle is different from the current, bind the texture
         if (boundTextureHandle != TexID) {
           boundTextureHandle = TexID;
@@ -771,5 +721,6 @@ namespace ImguiNvnBackend {
     // end the command recording and submit to queue.
     auto handle = bd->cmdBuf->EndRecording();
     bd->queue->SubmitCommands(1, &handle);
+    bd->textures.MarkSubmitted(bd->queue);
   }
 }

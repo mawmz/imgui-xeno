@@ -266,7 +266,11 @@ bool nvnImGui::InitImGui() {
 
     Logger::log("Initializing Backend.\n");
 
-    ImguiNvnBackend::InitBackend(initInfo);
+    if (!ImguiNvnBackend::InitBackend(initInfo)) {
+      Logger::log("ImGui backend initialization failed.\n");
+      ImGui::DestroyContext();
+      return false;
+    }
 
     InputHelper::initKBM();
 

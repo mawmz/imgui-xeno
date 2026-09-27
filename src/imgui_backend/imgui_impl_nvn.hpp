@@ -8,15 +8,13 @@
 #include "nvn_CppMethods.h"
 #include "types.h"
 #include "MemoryBuffer.h"
+#include "NvnTextureManager.h"
 
 #include "os/os_tick.hpp"
 
 #ifdef __cplusplus
 
 namespace ImguiNvnBackend {
-
-  static constexpr int MaxTexDescriptors = 256 + 100;
-  static constexpr int MaxSampDescriptors = 256 + 100;
 
   struct NvnBackendInitInfo {
     nvn::Device *device;
@@ -51,21 +49,9 @@ namespace ImguiNvnBackend {
     nvn::VertexStreamState streamState;
     nvn::VertexAttribState attribStates[3];
 
-    // font data
-
-    nvn::TexturePool texPool;
-    nvn::SamplerPool samplerPool;
-
-    nvn::MemoryPool sampTexMemPool;
-
-    nvn::MemoryPool fontMemPool;
-
-    int samplerId;
-    nvn::Sampler fontSampler;
-    int textureId;
-    nvn::Texture fontTexture;
-
-    nvn::TextureHandle fontTexHandle;
+    // Dynamic atlas textures, descriptors, and GPU lifetime tracking.
+    NvnTextureManager textures;
+    bool shaderProgramReady = false;
 
     // render data
 
@@ -94,9 +80,9 @@ namespace ImguiNvnBackend {
 
   bool setupShaders(u8 *shaderBinary, ulong binarySize);
 
-  bool setupFont();
+  bool setupTextures();
 
-  void InitBackend(const NvnBackendInitInfo &initInfo);
+  bool InitBackend(const NvnBackendInitInfo &initInfo);
 
   void ShutdownBackend();
 

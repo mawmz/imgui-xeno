@@ -14,7 +14,7 @@ public:
 
   void Finalize();
 
-  size_t GetPoolSize() const { return pool.GetSize(); }
+  size_t GetPoolSize() const { return poolReady ? pool.GetSize() : 0; }
 
   nvn::BufferAddress GetBufferAddress() const { return buffer.GetAddress(); };
 
@@ -30,6 +30,7 @@ private:
   nvn::MemoryPool pool;
   nvn::Buffer buffer;
 
-  void *memBuffer;
+  void *memBuffer = nullptr;
+  bool poolReady = false;
   bool mIsReady = false;
 };

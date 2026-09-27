@@ -3,98 +3,46 @@
 #include "logger/Logger.hpp"
 #include "helpers/memoryHelper.h"
 
-MemoryBuffer::MemoryBuffer(size_t size) {
-
-  auto *bd = ImguiNvnBackend::getBackendData();
-
-  size_t alignedSize = ALIGN_UP(size, 0x1000);
-
-  memBuffer = Mem::AllocateAlign(0x1000, alignedSize);
-  memset(memBuffer, 0, alignedSize);
-
-  bd->memPoolBuilder.SetDefaults()
-      .SetDevice(bd->device)
-      .SetFlags(nvn::MemoryPoolFlags::CPU_UNCACHED | nvn::MemoryPoolFlags::GPU_CACHED)
-      .SetStorage(memBuffer, alignedSize);
-
-  if (!pool.Initialize(&bd->memPoolBuilder)) {
-    Logger::log("Failed to Create Memory Pool!\n");
-    return;
-  }
-
-  bd->bufferBuilder.SetDevice(bd->device).SetDefaults().SetStorage(&pool, 0, alignedSize);
-
-  if (!buffer.Initialize(&bd->bufferBuilder)) {
-    Logger::log("Failed to Init Buffer!\n");
-    return;
-  }
-
-  mIsReady = true;
-}
+MemoryBuffer::MemoryBuffer(size_t size)
+    : MemoryBuffer(size, nvn::MemoryPoolFlags::CPU_UNCACHED | nvn::MemoryPoolFlags::GPU_CACHED) {}
 
 MemoryBuffer::MemoryBuffer(size_t size, nvn::MemoryPoolFlags flags) {
-
-  auto *bd = ImguiNvnBackend::getBackendData();
-
-  size_t alignedSize = ALIGN_UP(size, 0x1000);
-
+  auto* bd = ImguiNvnBackend::getBackendData();
+  const size_t alignedSize = ALIGN_UP(size, 0x1000);
   memBuffer = Mem::AllocateAlign(0x1000, alignedSize);
+  if (!memBuffer)
+    return;
   memset(memBuffer, 0, alignedSize);
 
-  bd->memPoolBuilder.SetDefaults()
-      .SetDevice(bd->device)
-      .SetFlags(flags)
-      .SetStorage(memBuffer, alignedSize);
-
-  if (!pool.Initialize(&bd->memPoolBuilder)) {
+  bd->memPoolBuilder.SetDefaults().SetDevice(bd->device).SetFlags(flags).SetStorage(memBuffer, alignedSize);
+  if (!(poolReady = pool.Initialize(&bd->memPoolBuilder))) {
     Logger::log("Failed to Create Memory Pool!\n");
+    Finalize();
     return;
   }
-
-  bd->bufferBuilder.SetDevice(bd->device).SetDefaults().SetStorage(&pool, 0, alignedSize);
-
-  if (!buffer.Initialize(&bd->bufferBuilder)) {
+  bd->bufferBuilder.SetDefaults().SetDevice(bd->device).SetStorage(&pool, 0, alignedSize);
+  if (!(mIsReady = buffer.Initialize(&bd->bufferBuilder))) {
     Logger::log("Failed to Init Buffer!\n");
-    return;
+    Finalize();
   }
-
-  mIsReady = true;
 }
 
-MemoryBuffer::MemoryBuffer(size_t size, void *bufferPtr, nvn::MemoryPoolFlags flags) {
-
-  auto *bd = ImguiNvnBackend::getBackendData();
-
-  // Copy to respect alignment for both size and pointer
-  memBuffer = Mem::AllocateAlign(0x1000, size);
-  memcpy(memBuffer, bufferPtr, size);
-
-  bd->memPoolBuilder.SetDefaults()
-      .SetDevice(bd->device)
-      .SetFlags(flags)
-      .SetStorage(memBuffer, size);
-
-  if (!pool.Initialize(&bd->memPoolBuilder)) {
-    Logger::log("Failed to Create Memory Pool!\n");
-    return;
-  }
-
-  bd->bufferBuilder.SetDevice(bd->device).SetDefaults().SetStorage(&pool, 0, size);
-
-  if (!buffer.Initialize(&bd->bufferBuilder)) {
-    Logger::log("Failed to Init Buffer!\n");
-    return;
-  }
-
-  mIsReady = true;
+MemoryBuffer::MemoryBuffer(size_t size, void* bufferPtr, nvn::MemoryPoolFlags flags)
+    : MemoryBuffer(size, flags) {
+  if (mIsReady)
+    memcpy(memBuffer, bufferPtr, size);
 }
 
 void MemoryBuffer::Finalize() {
-  IM_FREE(memBuffer);
-  pool.Finalize();
-  buffer.Finalize();
+  // The caller must wait for GPU completion before releasing this buffer.
+  if (mIsReady) buffer.Finalize();
+  if (poolReady) pool.Finalize();
+  Mem::Deallocate(memBuffer);
+  memBuffer = nullptr;
+  mIsReady = poolReady = false;
 }
 
 void MemoryBuffer::ClearBuffer() {
-  memset(memBuffer, 0, pool.GetSize());
+  if (mIsReady)
+    memset(memBuffer, 0, pool.GetSize());
 }
